@@ -1,0 +1,827 @@
+// =============================================================================
+// Restaurant Management System — multi-franchise, multi-location schema
+//
+// Tenancy hierarchy:
+//   Brand (franchisor, optional) ─┐
+//                                 └─ Organization (franchise owner = TENANT)
+//                                      └─ Location (outlet / branch)
+//                                           └─ floors, tables, orders, shifts...
+//
+// Isolation rules (enforced at three layers — see docs/ARCHITECTURE.md):
+//   1. Every tenant-owned row carries `organizationId`. Operational rows also
+//      carry `locationId`.
+//   2. Child → parent relations use COMPOSITE foreign keys that include
+//      `organizationId`, so the database itself rejects a row that points at
+//      another franchise's data (e.g. an OrderItem referencing a MenuItem of
+//      another owner).
+//   3. Postgres Row-Level Security (prisma/rls.sql) filters every query by the
+//      `app.org_id` session setting, which the Prisma tenant client sets.
+//
+// Money is stored as integer minor units (cents/paisa) to avoid float drift.
+// =============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  // CLI (migrate/db execute) uses the owner role. Runtime clients pick their
+  // own URL in lib/db — see SYSTEM_DATABASE_URL vs DATABASE_URL.
+  url      = env("DIRECT_URL")
+}
+
+// ─────────────────────────────── Enums ───────────────────────────────────────
+
+enum Role {
+  OWNER // franchise owner: every location in their organization
+  MANAGER // admin for assigned locations: POS, KDS, tables, inventory, staff, analytics
+  CASHIER // POS checkout, bill splitting, active tables, shift summary
+  WAITER // floor plan + order taking
+  KITCHEN // KDS (kitchen station)
+  BAR // KDS (bar station)
+}
+
+enum BrandRole {
+  FRANCHISOR_ADMIN // manages brand master menu, read-only network reports
+  FRANCHISOR_VIEWER
+}
+
+enum TableStatus {
+  FREE
+  OCCUPIED
+  RESERVED
+  NEEDS_CLEANING
+}
+
+enum TableShape {
+  SQUARE
+  ROUND
+  RECTANGLE
+  BOOTH
+}
+
+enum Station {
+  KITCHEN
+  BAR
+}
+
+enum OrderType {
+  DINE_IN
+  TAKEAWAY
+  DELIVERY
+}
+
+enum OrderStatus {
+  OPEN // being built / items fired
+  BILLED // bill printed, awaiting payment
+  PAID
+  VOID
+}
+
+enum TicketStatus {
+  NEW
+  IN_PREPARATION
+  READY
+  SERVED
+}
+
+enum DiscountType {
+  PERCENT
+  FIXED
+}
+
+enum SplitMode {
+  FULL
+  EQUAL
+  BY_SEAT
+  BY_ITEM
+}
+
+enum BillStatus {
+  OPEN
+  PARTIALLY_PAID
+  PAID
+}
+
+enum PaymentMethod {
+  CASH
+  CARD
+  MOBILE
+}
+
+enum PaymentStatus {
+  PENDING
+  CAPTURED
+  REFUNDED
+  FAILED
+}
+
+enum ShiftStatus {
+  OPEN
+  CLOSED
+}
+
+enum CashMovementType {
+  PAY_IN
+  PAY_OUT
+  DROP
+}
+
+enum StockMovementType {
+  PURCHASE
+  SALE // auto-deducted from recipes when an order is paid
+  WASTE
+  ADJUSTMENT
+  TRANSFER_IN
+  TRANSFER_OUT
+}
+
+enum ReservationStatus {
+  BOOKED
+  SEATED
+  CANCELLED
+  NO_SHOW
+}
+
+// ───────────────────────────── Tenancy ───────────────────────────────────────
+
+/// Franchisor. Owns the master menu template that franchisees can import.
+/// A Brand can NEVER read franchisee operational data directly — only the
+/// aggregated `DailySalesSummary` rows franchisees opt in to share.
+model Brand {
+  id        String   @id @default(cuid())
+  name      String
+  slug      String   @unique
+  createdAt DateTime @default(now())
+
+  organizations Organization[]
+  members       BrandMember[]
+}
+
+model BrandMember {
+  id      String    @id @default(cuid())
+  brandId String
+  userId  String
+  role    BrandRole
+
+  brand Brand @relation(fields: [brandId], references: [id], onDelete: Cascade)
+  user  User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([brandId, userId])
+}
+
+/// THE TENANT. One franchise owner's business. All data below hangs off this.
+model Organization {
+  id             String   @id @default(cuid())
+  brandId        String?
+  name           String
+  slug           String   @unique
+  currency       String   @default("USD")
+  shareWithBrand Boolean  @default(false) // opt-in aggregated reporting
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  brand          Brand?          @relation(fields: [brandId], references: [id], onDelete: SetNull)
+  locations      Location[]
+  memberships    Membership[]
+  categories     Category[]
+  menuItems      MenuItem[]
+  modifierGroups ModifierGroup[]
+  discounts      Discount[]
+  inventoryItems InventoryItem[]
+  auditLogs      AuditLog[]
+
+  @@index([brandId])
+}
+
+model Location {
+  id               String   @id @default(cuid())
+  organizationId   String
+  name             String
+  slug             String
+  timezone         String   @default("UTC")
+  address          String?
+  /// basis points: 1300 = 13.00%
+  taxRateBps       Int      @default(0)
+  serviceChargeBps Int      @default(0)
+  taxInclusive     Boolean  @default(false)
+  receiptFooter    String?
+  isActive         Boolean  @default(true)
+  createdAt        DateTime @default(now())
+
+  organization   Organization         @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  floorAreas     FloorArea[]
+  tables         DiningTable[]
+  orders         Order[]
+  shifts         Shift[]
+  reservations   Reservation[]
+  stockLevels    StockLevel[]
+  dailySummaries DailySalesSummary[]
+  memberAccess   MembershipLocation[]
+  menuOverrides  LocationMenuItem[]
+  orderCounters  OrderCounter[]
+
+  @@unique([organizationId, slug])
+  @@unique([id, organizationId]) // target for composite FKs
+  @@index([organizationId])
+}
+
+// ─────────────────────────── Identity & RBAC ─────────────────────────────────
+
+/// A person. Identity is global (one login), authority is per-organization
+/// via Membership, so one human can work for two franchise owners without
+/// their data ever mixing.
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  name         String
+  passwordHash String
+  avatarUrl    String?
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+
+  memberships Membership[]
+  brandRoles  BrandMember[]
+  sessions    Session[]
+}
+
+model Membership {
+  id             String   @id @default(cuid())
+  organizationId String
+  userId         String
+  role           Role
+  /// 4–6 digit quick-switch PIN for shared POS terminals, hashed, unique per org
+  pinHash        String?
+  /// true → every current and future location of the org (OWNER default)
+  allLocations   Boolean  @default(false)
+  isActive       Boolean  @default(true)
+  createdAt      DateTime @default(now())
+
+  organization Organization         @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  user         User                 @relation(fields: [userId], references: [id], onDelete: Cascade)
+  locations    MembershipLocation[]
+  ordersTaken  Order[]              @relation("OrderWaiter")
+  payments     Payment[]
+  shifts       Shift[]
+  auditLogs    AuditLog[]
+
+  @@unique([organizationId, userId])
+  @@unique([id, organizationId])
+  @@index([userId])
+}
+
+/// Which locations a non-owner member may act in.
+model MembershipLocation {
+  membershipId   String
+  locationId     String
+  organizationId String
+
+  membership Membership @relation(fields: [membershipId, organizationId], references: [id, organizationId], onDelete: Cascade)
+  location   Location   @relation(fields: [locationId, organizationId], references: [id, organizationId], onDelete: Cascade)
+
+  @@id([membershipId, locationId])
+  @@index([locationId])
+}
+
+/// Refresh-token store (access JWTs are short-lived & stateless).
+model Session {
+  id        String    @id @default(cuid())
+  userId    String
+  tokenHash String    @unique
+  userAgent String?
+  ip        String?
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+// ──────────────────────────── Floor plan ─────────────────────────────────────
+
+model FloorArea {
+  id             String @id @default(cuid())
+  organizationId String
+  locationId     String
+  name           String // Main Dining, Patio, Bar
+  sortOrder      Int    @default(0)
+  /// canvas size in grid units for the drag-and-drop editor
+  width          Int    @default(1200)
+  height         Int    @default(800)
+
+  location Location      @relation(fields: [locationId, organizationId], references: [id, organizationId], onDelete: Cascade)
+  tables   DiningTable[]
+
+  @@unique([id, organizationId])
+  @@index([locationId])
+}
+
+model DiningTable {
+  id              String      @id @default(cuid())
+  organizationId  String
+  locationId      String
+  floorAreaId     String
+  label           String // "T12"
+  seats           Int         @default(4)
+  shape           TableShape  @default(SQUARE)
+  posX            Int         @default(0)
+  posY            Int         @default(0)
+  width           Int         @default(96)
+  height          Int         @default(96)
+  rotation        Int         @default(0)
+  status          TableStatus @default(FREE)
+  statusChangedAt DateTime    @default(now())
+  /// when merged, the child table points to the primary table
+  mergedIntoId    String?
+  /// optimistic concurrency for simultaneous drag / status edits
+  version         Int         @default(0)
+
+  location     Location      @relation(fields: [locationId, organizationId], references: [id, organizationId], onDelete: Cascade)
+  floorArea    FloorArea     @relation(fields: [floorAreaId, organizationId], references: [id, organizationId], onDelete: Cascade)
+  mergedInto   DiningTable?  @relation("TableMerge", fields: [mergedIntoId], references: [id], onDelete: SetNull)
+  mergedTables DiningTable[] @relation("TableMerge")
+  orderTables  OrderTable[]
+  reservations Reservation[]
+
+  @@unique([locationId, label])
+  @@unique([id, organizationId])
+  @@index([locationId, status])
+}
+
+model Reservation {
+  id             String            @id @default(cuid())
+  organizationId String
+  locationId     String
+  tableId        String?
+  guestName      String
+  guestPhone     String?
+  partySize      Int
+  startsAt       DateTime
+  durationMin    Int               @default(90)
+  status         ReservationStatus @default(BOOKED)
+  notes          String?
+  createdAt      DateTime          @default(now())
+
+  location Location     @relation(fields: [locationId, organizationId], references: [id, organizationId], onDelete: Cascade)
+  table    DiningTable? @relation(fields: [tableId], references: [id], onDelete: SetNull)
+
+  @@index([locationId, startsAt])
+}
+
+// ─────────────────────────────── Menu ────────────────────────────────────────
+// Menu lives at organization level (shared by all of an owner's outlets);
+// per-location price/availability overrides live in LocationMenuItem.
+
+model Category {
+  id             String  @id @default(cuid())
+  organizationId String
+  name           String
+  color          String? // hex accent for POS tiles
+  icon           String? // lucide icon name
+  sortOrder      Int     @default(0)
+  isActive       Boolean @default(true)
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  items        MenuItem[]
+
+  @@unique([id, organizationId])
+  @@index([organizationId, sortOrder])
+}
+
+model MenuItem {
+  id             String   @id @default(cuid())
+  organizationId String
+  categoryId     String
+  name           String
+  description    String?
+  sku            String?
+  imageUrl       String?
+  price          Int // minor units
+  station        Station  @default(KITCHEN)
+  prepMinutes    Int      @default(10)
+  /// keyboard shortcut code on POS, e.g. "B1"
+  shortcode      String?
+  isAvailable    Boolean  @default(true)
+  isArchived     Boolean  @default(false)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  organization   Organization            @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  category       Category                @relation(fields: [categoryId, organizationId], references: [id, organizationId], onDelete: Restrict)
+  modifierGroups MenuItemModifierGroup[]
+  locationPrices LocationMenuItem[]
+  recipe         RecipeLine[]
+  orderItems     OrderItem[]
+
+  @@unique([id, organizationId])
+  @@unique([organizationId, sku])
+  @@unique([organizationId, shortcode])
+  @@index([organizationId, categoryId])
+}
+
+model LocationMenuItem {
+  organizationId String
+  locationId     String
+  menuItemId     String
+  priceOverride  Int?
+  isAvailable    Boolean @default(true) // "86" an item at one outlet
+
+  location Location @relation(fields: [locationId, organizationId], references: [id, organizationId], onDelete: Cascade)
+  menuItem MenuItem @relation(fields: [menuItemId, organizationId], references: [id, organizationId], onDelete: Cascade)
+
+  @@id([locationId, menuItemId])
+}
+
+model ModifierGroup {
+  id             String @id @default(cuid())
+  organizationId String
+  name           String // "Spice level", "Extras"
+  minSelect      Int    @default(0)
+  maxSelect      Int    @default(1)
+
+  organization Organization            @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  modifiers    Modifier[]
+  menuItems    MenuItemModifierGroup[]
+
+  @@unique([id, organizationId])
+}
+
+model Modifier {
+  id              String @id @default(cuid())
+  organizationId  String
+  modifierGroupId String
+  name            String // "Extra sauce"
+  priceDelta      Int    @default(0)
+  sortOrder       Int    @default(0)
+
+  group ModifierGroup @relation(fields: [modifierGroupId, organizationId], references: [id, organizationId], onDelete: Cascade)
+
+  @@index([modifierGroupId])
+}
+
+model MenuItemModifierGroup {
+  organizationId  String
+  menuItemId      String
+  modifierGroupId String
+  sortOrder       Int    @default(0)
+
+  menuItem MenuItem      @relation(fields: [menuItemId, organizationId], references: [id, organizationId], onDelete: Cascade)
+  group    ModifierGroup @relation(fields: [modifierGroupId, organizationId], references: [id, organizationId], onDelete: Cascade)
+
+  @@id([menuItemId, modifierGroupId])
+}
+
+model Discount {
+  id              String       @id @default(cuid())
+  organizationId  String
+  name            String
+  code            String?
+  type            DiscountType
+  /// PERCENT → basis points, FIXED → minor units
+  value           Int
+  requiresManager Boolean      @default(false)
+  isActive        Boolean      @default(true)
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  orders       Order[]
+
+  @@unique([id, organizationId])
+  @@unique([organizationId, code])
+}
+
+// ────────────────────────────── Orders ───────────────────────────────────────
+
+/// Gap-free, per-location, per-business-day order numbers ("#0042").
+model OrderCounter {
+  organizationId String
+  locationId     String
+  businessDate   DateTime @db.Date
+  lastNumber     Int      @default(0)
+
+  location Location @relation(fields: [locationId, organizationId], references: [id, organizationId], onDelete: Cascade)
+
+  @@id([locationId, businessDate])
+}
+
+model Order {
+  id             String      @id @default(cuid())
+  organizationId String
+  locationId     String
+  number         Int
+  businessDate   DateTime    @db.Date
+  type           OrderType   @default(DINE_IN)
+  status         OrderStatus @default(OPEN)
+  waiterId       String?
+  shiftId        String?
+  guestCount     Int         @default(1)
+  discountId     String?
+  note           String?
+  // Totals are denormalised snapshots recomputed server-side on every change.
+  subtotal       Int         @default(0)
+  discountTotal  Int         @default(0)
+  serviceCharge  Int         @default(0)
+  taxTotal       Int         @default(0)
+  total          Int         @default(0)
+  paidTotal      Int         @default(0)
+  version        Int         @default(0) // optimistic locking across terminals
+  /// client-generated UUID so retries from flaky Wi-Fi never duplicate orders
+  idempotencyKey String?     @unique
+  openedAt       DateTime    @default(now())
+  closedAt       DateTime?
+
+  location Location     @relation(fields: [locationId, organizationId], references: [id, organizationId], onDelete: Restrict)
+  waiter   Membership?  @relation("OrderWaiter", fields: [waiterId], references: [id], onDelete: SetNull)
+  shift    Shift?       @relation(fields: [shiftId], references: [id], onDelete: SetNull)
+  discount Discount?    @relation(fields: [discountId], references: [id], onDelete: SetNull)
+  tables   OrderTable[]
+  items    OrderItem[]
+  tickets  KdsTicket[]
+  bills    Bill[]
+  payments Payment[]
+
+  @@unique([id, organizationId])
+  @@unique([locationId, businessDate, number])
+  @@index([locationId, status])
+  @@index([organizationId, businessDate])
+}
+
+/// Many-to-many so merged tables share one order and transfers are a re-point.
+model OrderTable {
+  orderId   String
+  tableId   String
+  isPrimary Boolean @default(true)
+
+  order Order       @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  table DiningTable @relation(fields: [tableId], references: [id], onDelete: Cascade)
+
+  @@id([orderId, tableId])
+  @@index([tableId])
+}
+
+model OrderItem {
+  id             String       @id @default(cuid())
+  organizationId String
+  orderId        String
+  menuItemId     String
+  ticketId       String?
+  /// snapshots — menu edits must never rewrite historical bills
+  name           String
+  unitPrice      Int
+  quantity       Int          @default(1)
+  modifiersTotal Int          @default(0)
+  lineTotal      Int
+  seatNumber     Int?
+  station        Station
+  notes          String?
+  status         TicketStatus @default(NEW)
+  isVoided       Boolean      @default(false)
+  voidReason     String?
+  createdAt      DateTime     @default(now())
+
+  order     Order               @relation(fields: [orderId, organizationId], references: [id, organizationId], onDelete: Cascade)
+  menuItem  MenuItem            @relation(fields: [menuItemId, organizationId], references: [id, organizationId], onDelete: Restrict)
+  ticket    KdsTicket?          @relation(fields: [ticketId], references: [id], onDelete: SetNull)
+  modifiers OrderItemModifier[]
+  billLines BillLine[]
+
+  @@index([orderId])
+  @@index([organizationId, menuItemId])
+}
+
+model OrderItemModifier {
+  id          String  @id @default(cuid())
+  orderItemId String
+  modifierId  String?
+  name        String
+  priceDelta  Int
+
+  orderItem OrderItem @relation(fields: [orderItemId], references: [id], onDelete: Cascade)
+}
+
+/// One KDS card = one "fire" of items to one station.
+model KdsTicket {
+  id             String       @id @default(cuid())
+  organizationId String
+  locationId     String
+  orderId        String
+  station        Station
+  status         TicketStatus @default(NEW)
+  firedAt        DateTime     @default(now())
+  startedAt      DateTime?
+  readyAt        DateTime?
+  servedAt       DateTime?
+  bumpedById     String?
+
+  order Order       @relation(fields: [orderId, organizationId], references: [id, organizationId], onDelete: Cascade)
+  items OrderItem[]
+
+  @@index([locationId, station, status])
+}
+
+// ────────────────────────── Billing & payments ───────────────────────────────
+
+model Bill {
+  id         String     @id @default(cuid())
+  orderId    String
+  mode       SplitMode  @default(FULL)
+  /// 1-based index within the split ("Bill 2 of 3")
+  splitIndex Int        @default(1)
+  splitCount Int        @default(1)
+  seatNumber Int?
+  amountDue  Int
+  amountPaid Int        @default(0)
+  status     BillStatus @default(OPEN)
+  createdAt  DateTime   @default(now())
+
+  order    Order      @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  lines    BillLine[]
+  payments Payment[]
+
+  @@index([orderId])
+}
+
+/// For BY_ITEM / BY_SEAT splits: which item quantities sit on which bill.
+model BillLine {
+  billId      String
+  orderItemId String
+  quantity    Int
+  amount      Int
+
+  bill      Bill      @relation(fields: [billId], references: [id], onDelete: Cascade)
+  orderItem OrderItem @relation(fields: [orderItemId], references: [id], onDelete: Cascade)
+
+  @@id([billId, orderItemId])
+}
+
+model Payment {
+  id             String        @id @default(cuid())
+  organizationId String
+  locationId     String
+  orderId        String
+  billId         String?
+  shiftId        String?
+  cashierId      String?
+  method         PaymentMethod
+  status         PaymentStatus @default(CAPTURED)
+  amount         Int
+  tip            Int           @default(0)
+  tendered       Int? // cash handed over
+  change         Int? // cash returned
+  provider       String? // "stripe", "esewa", "khalti", "terminal"
+  reference      String?
+  idempotencyKey String?       @unique
+  createdAt      DateTime      @default(now())
+
+  order   Order       @relation(fields: [orderId, organizationId], references: [id, organizationId], onDelete: Restrict)
+  bill    Bill?       @relation(fields: [billId], references: [id], onDelete: SetNull)
+  shift   Shift?      @relation(fields: [shiftId], references: [id], onDelete: SetNull)
+  cashier Membership? @relation(fields: [cashierId], references: [id], onDelete: SetNull)
+
+  @@index([locationId, createdAt])
+  @@index([shiftId])
+}
+
+model Shift {
+  id             String      @id @default(cuid())
+  organizationId String
+  locationId     String
+  cashierId      String
+  terminal       String?
+  status         ShiftStatus @default(OPEN)
+  openingFloat   Int         @default(0)
+  expectedCash   Int?
+  countedCash    Int?
+  variance       Int?
+  notes          String?
+  openedAt       DateTime    @default(now())
+  closedAt       DateTime?
+
+  location      Location       @relation(fields: [locationId, organizationId], references: [id, organizationId], onDelete: Restrict)
+  cashier       Membership     @relation(fields: [cashierId], references: [id], onDelete: Restrict)
+  orders        Order[]
+  payments      Payment[]
+  cashMovements CashMovement[]
+
+  @@index([locationId, status])
+}
+
+model CashMovement {
+  id        String           @id @default(cuid())
+  shiftId   String
+  type      CashMovementType
+  amount    Int
+  reason    String?
+  createdAt DateTime         @default(now())
+
+  shift Shift @relation(fields: [shiftId], references: [id], onDelete: Cascade)
+}
+
+// ───────────────────────────── Inventory ─────────────────────────────────────
+
+model InventoryItem {
+  id             String  @id @default(cuid())
+  organizationId String
+  name           String
+  sku            String?
+  unit           String // g, ml, pcs
+  costPerUnit    Int     @default(0) // minor units per unit
+
+  organization Organization    @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  levels       StockLevel[]
+  recipeLines  RecipeLine[]
+  movements    StockMovement[]
+
+  @@unique([id, organizationId])
+  @@unique([organizationId, sku])
+}
+
+/// Stock is tracked per location — outlets of the same owner never share counts.
+model StockLevel {
+  organizationId  String
+  locationId      String
+  inventoryItemId String
+  onHand          Decimal @db.Decimal(14, 3)
+  reorderLevel    Decimal @default(0) @db.Decimal(14, 3)
+
+  location Location      @relation(fields: [locationId, organizationId], references: [id, organizationId], onDelete: Cascade)
+  item     InventoryItem @relation(fields: [inventoryItemId, organizationId], references: [id, organizationId], onDelete: Cascade)
+
+  @@id([locationId, inventoryItemId])
+}
+
+model RecipeLine {
+  organizationId  String
+  menuItemId      String
+  inventoryItemId String
+  quantity        Decimal @db.Decimal(14, 3)
+
+  menuItem MenuItem      @relation(fields: [menuItemId, organizationId], references: [id, organizationId], onDelete: Cascade)
+  item     InventoryItem @relation(fields: [inventoryItemId, organizationId], references: [id, organizationId], onDelete: Cascade)
+
+  @@id([menuItemId, inventoryItemId])
+}
+
+model StockMovement {
+  id              String            @id @default(cuid())
+  organizationId  String
+  locationId      String
+  inventoryItemId String
+  type            StockMovementType
+  quantity        Decimal           @db.Decimal(14, 3) // signed
+  reference       String? // orderId, PO number…
+  createdAt       DateTime          @default(now())
+
+  item InventoryItem @relation(fields: [inventoryItemId, organizationId], references: [id, organizationId], onDelete: Cascade)
+
+  @@index([locationId, inventoryItemId, createdAt])
+}
+
+// ──────────────────────── Analytics & audit ──────────────────────────────────
+
+/// Pre-aggregated rollup written when an order is PAID, so dashboards read a
+/// handful of rows instead of scanning orders. Hourly buckets drive the
+/// Peak Hours chart; breakdown JSON holds per-method / per-category totals.
+model DailySalesSummary {
+  organizationId  String
+  locationId      String
+  businessDate    DateTime @db.Date
+  grossRevenue    Int      @default(0)
+  netRevenue      Int      @default(0)
+  taxTotal        Int      @default(0)
+  discountTotal   Int      @default(0)
+  orderCount      Int      @default(0)
+  guestCount      Int      @default(0)
+  /// { "CASH": 12000, "CARD": 54000, "MOBILE": 8000 }
+  byPaymentMethod Json     @default("{}")
+  /// { "<categoryId>": { "name": "Pizza", "revenue": 1234, "qty": 9 } }
+  byCategory      Json     @default("{}")
+  /// 24-length array of revenue per local hour
+  byHour          Json     @default("[]")
+  updatedAt       DateTime @updatedAt
+
+  location Location @relation(fields: [locationId, organizationId], references: [id, organizationId], onDelete: Cascade)
+
+  @@id([locationId, businessDate])
+  @@index([organizationId, businessDate])
+}
+
+model AuditLog {
+  id             String   @id @default(cuid())
+  organizationId String
+  locationId     String?
+  actorId        String?
+  action         String // "order.void", "discount.apply", "shift.close"
+  entity         String
+  entityId       String
+  payload        Json?
+  createdAt      DateTime @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  actor        Membership?  @relation(fields: [actorId], references: [id], onDelete: SetNull)
+
+  @@index([organizationId, createdAt])
+  @@index([entity, entityId])
+}
