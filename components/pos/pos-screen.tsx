@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { formatMoney } from "@/lib/money";
+import { uuid } from "@/lib/uuid";
 import { computeTotals, lineTotal, type PricingRules } from "@/lib/pricing";
 import { cn } from "@/lib/utils";
 import { useCart } from "./cart-store";
@@ -111,7 +112,7 @@ export function PosScreen({ mode, apiBase, currency, rules, categories, items, a
   };
 
   const orderPayload = () => ({
-    idempotencyKey: crypto.randomUUID(),
+    idempotencyKey: uuid(),
     type: table ? "DINE_IN" : "TAKEAWAY",
     tableId: table?.id,
     lines: lines.map((l) => ({
@@ -139,7 +140,7 @@ export function PosScreen({ mode, apiBase, currency, rules, categories, items, a
 
   const pay = async (split: SplitChoice, tenders: Tender[]) => {
     const orderId = selectedOrder?.id ?? (await post(`${apiBase}/orders`, orderPayload())).orderId;
-    await post(`${apiBase}/orders/${orderId}/payments`, { idempotencyKey: crypto.randomUUID(), split, tenders });
+    await post(`${apiBase}/orders/${orderId}/payments`, { idempotencyKey: uuid(), split, tenders });
     clear();
     setSelectedOrderId(null);
     router.refresh();

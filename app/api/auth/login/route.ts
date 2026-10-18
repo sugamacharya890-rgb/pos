@@ -53,7 +53,9 @@ export async function POST(req: Request) {
   res.cookies.set(ACCESS_COOKIE, token, {
     httpOnly: true,
     sameSite: "lax",
-    secure: process.env.NODE_ENV === "production",
+    // Secure only when actually served over HTTPS: phones/tablets on the LAN reach
+    // a local server via plain http://192.168.x.x and would silently drop it.
+    secure: new URL(req.url).protocol === "https:" || req.headers.get("x-forwarded-proto") === "https",
     path: "/",
     maxAge: ACCESS_TTL_SECONDS,
   });
